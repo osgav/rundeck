@@ -1,0 +1,25 @@
+---
+# Instance Type
+instance_type: t2.micro
+
+# Region & AMI ID
+# Frankfurt Amazon Linux AMI
+region: eu-central-1
+image: ami-0044b96f
+# Tokyo Amazon Linux AMI
+#region: ap-northeast-1
+#image: ami-1a15c77b
+
+# Security Group & Key Pair
+security_group: <enter a security group name> 
+security_group_desc: <security group description> 
+keypair: <name of key pair that will provide access to EC2 instance> 
+
+# No. of instances
+count: 1
+
+# Tags
+Name: <give EC2 instance a name> 
+Project: Testing 
+# more tags requires update to ec2_control.yml (or custom) playbook
+
