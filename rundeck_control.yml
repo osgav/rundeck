@@ -1,0 +1,183 @@
+---
+
+#
+# Playbook for provisioning, configuring and terminating Rundeck EC2 instances
+#
+# 3 plays
+# 1 for provisioning (ec2 instance/security group/add to inventory)
+# 1 for configuring (install rundeck repo & key, install rundeck, start rundeck)
+# 1 for terminating (based on security group specified in vars_ec2 file)
+#
+# only 1 play should be run when playbook is executed - determined by tags -t or --tags
+# expects an "extra variable" -e or --extra-vars specifying what "type" of instance to create (vars_ec2 file)
+#
+# Example usage:
+#
+# $ ansible-playbook -i hosts/coreinfx rundeck_control.yml -t "provision" -e "type=rundeck-test"
+# $ ansible-playbook -i hosts/coreinfx rundeck_control.yml -t "configure" -e "type=rundeck-test"
+# $ ansible-playbook -i hosts/coreinfx rundeck_control.yml -t "terminate" -e "type=rundeck-test"
+#
+# Currently only expects 1 Rundeck instance in a Security Group
+# If there is more than 1 instance, the "terminate" play will wipe them all out
+# No way to single out an individual instance in a security group yet
+#
+
+  
+  ####################################################################################
+  # PLAY 1  --tags "provision"
+  # provision security group / ec2 instance / add node to inventory
+  - name: Provision EC2 instance for Rundeck
+    tags: provision
+    hosts: local
+    connection: local
+    gather_facts: False
+
+    # Read in variables specified by playbook command --extra-vars "type=new-node-template"
+    pre_tasks:
+      - include_vars: vars_ec2/{{type}}.yml
+    
+    # PLAY 1 tasks
+    tasks:
+
+      # Create Security Group for EC2 instance allowing SSH in / everything out
+      # !!! OPEN TO THE WORLD !!! 
+      - name: Create Security Group - {{ security_group }}
+        local_action: 
+          module: ec2_group
+          name: "{{ security_group }}"
+          description: "{{ security_group_desc }}"
+          region: "{{ region }}"
+          vpc_id: "{{ vpc_id }}"
+          rules:
+            - proto: tcp
+              from_port: 22
+              to_port: 22
+              cidr_ip: 0.0.0.0/0
+            - proto: tcp
+              from_port: 4440 
+              to_port: 4440
+              cidr_ip: 0.0.0.0/0
+          rules_egress:
+            - proto: all
+              cidr_ip: 0.0.0.0/0
+
+      # Create EC2 instance as per vars_ec2 file and place in Security Group
+      - name: Launch EC2 instance - {{ Name }}
+        local_action: ec2 
+                      group={{ security_group }} 
+                      instance_type={{ instance_type}} 
+                      image={{ image }} 
+                      wait=true 
+                      region={{ region }} 
+                      vpc_subnet_id={{ vpc_subnet_id }}
+                      keypair={{ keypair }}
+                      count={{count}}
+        register: ec2
+
+      # Update specific Ansible inventory (./hosts/coreinfx) with new EC2 instance public IP address
+      - name: Add public IP for {{ Name }} to coreinfx inventory 
+        local_action: lineinfile 
+                      dest="./hosts/coreinfx" 
+                      regexp={{ item.public_ip }} 
+                      insertafter="[rundeck]" line={{ item.public_ip }}
+        with_items: "{{ ec2.instances }}"
+
+      # Check EC2 instance has actually started
+      - name: Ensure {{ Name }} has started
+        local_action: wait_for 
+                      host={{ item.public_ip }} 
+                      port=22 
+                      state=started
+        with_items: "{{ ec2.instances }}"
+
+      # Tag EC2 instance
+      - name: Tag EC2 instance with Project = {{ Project }} & Name = {{ Name }}
+        local_action: ec2_tag resource={{ item.id }} region={{ region }} state=present
+        with_items: "{{ ec2.instances }}"
+        args:
+          tags:
+            Name: "{{ Name }}"
+            Project: "{{ Project }}"
+            Created_By: "rundeck_control"
+
+  ####################################################################################
+  # PLAY 2 --tags "configure"
+  - name: Configure Rundeck Server
+    tags: configure
+    hosts: rundeck 
+    gather_facts: True
+
+    # Read variables specified by playbook command --extra-vars "type=new-node-template"
+    pre_tasks:
+      - include_vars: vars_ec2/{{type}}.yml
+
+    # PLAY 2 tasks
+    tasks:
+
+      # install rundeck repo
+      - name: Install Rundeck Repository
+        become: yes
+        yum_repository:
+          name: rundeck
+          description: Rundeck Repo
+          baseurl: http://dl.bintray.com/rundeck/rundeck-rpm
+          gpgkey: http://rundeck.org/keys/BUILD-GPG-KEY-Rundeck.org.key
+          gpgcheck: yes
+
+      # install rundeck
+      - name: Install Rundeck
+        become: yes
+        yum:
+          name: "{{item}}"
+          state: latest
+        with_items:
+          - "rundeck"
+          - "rundeck-config"
+
+      # Gather EC2 facts about Rundeck server
+      - name: Gather EC2 facts
+        action: ec2_facts
+
+      # Update rundeck config with EC2 fact...
+      - name: Update Rundeck config with EC2 instance hostname 
+        become: yes
+        replace: dest=/etc/rundeck/rundeck-config.properties regexp='http:\/\/(.*):4440' replace='http://{{ ansible_ec2_public_hostname }}:4440'
+
+      # Start Rundeck service
+      - name: service rundeckd start
+        become: yes
+        service: name=rundeckd state=started
+
+  ####################################################################################
+  # PLAY 3 --tags "terminate"
+  # terminate EC2 instance(s) listed under [rundeck] in Ansible ./hosts/coreinfx inventory
+  - name: Terminate EC2 instance(s)
+    tags: terminate
+    hosts: rundeck 
+    gather_facts: False
+
+    # Read variables specified by playbook command --extra-vars "type=rundeck-test"
+    pre_tasks:
+      - include_vars: vars_ec2/{{type}}.yml
+
+    # PLAY 3 tasks
+    tasks:
+
+      # Gather EC2 facts
+      - name: Gather EC2 facts
+        action: ec2_facts
+
+      # Print IP(s) of instances that will be terminated
+      - name: Print IP/Name of instances to be terminated
+        action: debug msg="IP address of server to be terminated {{ ansible_ec2_public_ipv4 }} ({{ Name }})"
+        when: ansible_ec2_security_groups == "{{ security_group }}"
+
+      # Terminate EC2 instances under [rundeck] group that are in Security Group specified in vars_ec2 file
+      - name: Terminate Rundeck instances in coreinfx inventory
+        local_action:
+          module: ec2
+          state: 'absent'
+          region: "{{ region}}"
+          instance_ids: "{{ ansible_ec2_instance_id }}"
+        when: ansible_ec2_security_groups == "{{ security_group }}"
+
